@@ -10,9 +10,12 @@
 #include <tuple>
 #include <vector>
 
-template <class Task> class ThreadPool;
+/* Represents a pool of threads you can assign tasks to */
+template <class Task>
+class ThreadPool;
 
-template <class T, typename... Args> class ThreadPool<T(Args...)> {
+template <class T, typename... Args>
+class ThreadPool<T(Args...)> {
 public:
 	struct NoneType {};
 	using value_t = std::conditional_t<std::is_void_v<T>, NoneType, T>;
@@ -27,18 +30,33 @@ private:
 	};
 
 public:
+	/* Represents a task result, which you can use to retrieve the return value
+	once the task is done executing
+	*/
 	class result {
 		friend class ThreadPool;
 		_result_impl *_res = new _result_impl;
+		result() = default;
 
 	public:
-		result() = default;
 		result(const result &) = delete;
 		result(result &&other) : _res(other._res) { other._res = nullptr; }
+		/* Queries the state of the corresponding task
+		@return true if the task finished executing correctly, false otherwise
+		@throw std::runtime_error if the result object is invalid
+		*/
 		bool ready() const {
+#ifndef NDEBUG
+			if (!_res) throw std::runtime_error("Invalid result object");
+#endif
 			unique_lock lock(_res->_m);
 			return !_res->_cancelled && (bool)_res->_val;
 		}
+		/* Waits until the task is either done, or cancelled
+		@return true if the task finished and a result is available, false
+		otherwise
+		@throw std::runtime_error if the result object is invalid
+		 */
 		bool wait() {
 #ifndef NDEBUG
 			if (!_res) throw std::runtime_error("Invalid result object");
@@ -51,6 +69,13 @@ public:
 			});
 			return (bool)_res->_val;
 		}
+		/* Waits for the task to finish or be cancelled, and returns the result
+		@return An object which contains the return value if the task finished
+		succesfully, or nothing if the task was cancelled. If the underlying
+		callable object had void as a return type, the result will be
+		ThreadPool::NoneType
+		@throw std::runtime_error if the result object is invalid
+		 */
 		std::optional<value_t> get() {
 #ifndef NDEBUG
 			if (!_res) throw std::runtime_error("Invalid result object");
@@ -65,12 +90,17 @@ public:
 		}
 	};
 
+	/* Constructor
+	@param n: The number of threads to create
+	 */
 	explicit ThreadPool(size_t n) {
 		for (size_t i = 0; i < n; i++) {
 			_threads.emplace_back(&ThreadPool::thread_loop, this);
 		}
 	}
 	ThreadPool(ThreadPool &) = delete;
+	/* Restarts the thread pool if it had previously been stopped. Otherwise,
+	 * does nothing */
 	void restart() {
 		unique_lock lock(_mutex);
 		if (!_stopped) return;
@@ -79,6 +109,14 @@ public:
 			t = std::thread(&ThreadPool::thread_loop, this);
 		}
 	}
+	/* Enqueues a new task
+	@param f: The callable object to invoke
+	@param args: The arguments to forward to f
+	@return A result object you can use to wait to the task to end, and retrieve
+	the result
+	@warning If the return value is discarded, the current thread will block
+	until the newly created task is over
+	 */
 	template <class F>
 	[[nodiscard]]
 	result run_task(F &&f, Args &&...args) {
@@ -91,6 +129,13 @@ public:
 		_cv.notify_one();
 		return r;
 	}
+	/* Stops the threads.
+	If cancel is set to false, the current thread will block
+	until all tasks in the queue have been processed. Otherwise, the tasks
+	still awaiting for execution will get cancelled. Either way, the tasks
+	currently being executing will finish normally
+	@param cancel: Whether to cancel the tasks still in the queue
+	 */
 	void stop(bool cancel = false) {
 		if (_stopped) return;
 		if (!cancel) {
@@ -117,6 +162,7 @@ public:
 		lock.unlock();
 		join_threads();
 	}
+	/* Wait until all tasks in the queue have been processed */
 	void wait() {
 		unique_lock lock(_waitMutex);
 		if (!_running_task || _stopped) return;
