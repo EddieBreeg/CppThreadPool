@@ -123,7 +123,7 @@ public:
 	/* Restarts the thread pool if it had previously been stopped. Otherwise,
 	 * does nothing */
 	void restart() {
-		unique_lock lock(_mutex);
+		std::lock_guard lock(_mutex);
 		if (!_stopped) return;
 		_stopped = false;
 		for (auto &t : _threads) {
@@ -143,10 +143,11 @@ public:
 	result run_task(F &&f, Args &&...args) {
 		result r;
 		std::tuple<Args &&...> A{ std::forward<Args>(args)... };
-		unique_lock lock(_mutex);
-		_tasks.emplace(task{ r._res, f, std::move(A) });
-		_running_task = true;
-		lock.unlock();
+		{
+			std::lock_guard lock(_mutex);
+			_tasks.emplace(task{ r._res, f, std::move(A) });
+			_running_task = true;
+		}
 		_cv.notify_one();
 		return r;
 	}
@@ -162,25 +163,27 @@ public:
 		if (!cancel) {
 			wait();
 			{
-				unique_lock lock(_mutex);
+				std::lock_guard lock(_mutex);
 				_stopped = true;
-				_cv.notify_all();
 			}
+			_cv.notify_all();
 			join_threads();
 			return;
 		}
-		unique_lock lock(_mutex);
-		_stopped = true;
-		_cv.notify_all();
-		while (!_tasks.empty()) {
-			task &&t = std::move(_tasks.front());
-			_tasks.pop();
-			unique_lock lock(t._res->_m);
-			t._res->_cancelled = true;
-			lock.unlock();
-			t._res->_cv.notify_one();
+		{
+			std::lock_guard lock(_mutex);
+			_stopped = true;
+			_cv.notify_all();
+			while (!_tasks.empty()) {
+				task &&t = std::move(_tasks.front());
+				_tasks.pop();
+				{
+					std::lock_guard lock(t._res->_m);
+					t._res->_cancelled = true;
+				}
+				t._res->_cv.notify_one();
+			}
 		}
-		lock.unlock();
 		join_threads();
 	}
 	/* Wait until all tasks in the queue have been processed */
@@ -216,20 +219,19 @@ private:
 			if constexpr (!std::is_void_v<T>) {
 				auto val = std::apply(t._f, std::move(t._args));
 				{
-					unique_lock lock{ t._res->_m };
+					std::lock_guard lock{ t._res->_m };
 					t._res->_val = std::move(val);
 				}
 			} else {
 				std::apply(t._f, std::move(t._args));
-				unique_lock lock{ t._res->_m };
+				std::lock_guard lock{ t._res->_m };
 				t._res->_val = NoneType{};
 			}
 			t._res->_cv.notify_one();
 			{
-				unique_lock lock(_waitMutex);
+				std::lock_guard lock(_waitMutex);
 				if (_running_task && _tasks.empty()) {
 					_running_task = false;
-					lock.unlock();
 					_cv.notify_one();
 				}
 			}
