@@ -35,6 +35,10 @@ struct operation_cancelled_exception : public std::exception {
 	inline const char *what() const { return "Operation was cancelled"; }
 };
 
+/**
+ * Represents a generic thread pool you can assign tasks too
+ * @tparam Func: The type of callable objects that will be run by the threads
+ */
 template <class Func>
 class ThreadPool;
 
@@ -48,11 +52,24 @@ class ThreadPool<T(Args...)> {
 	};
 
 public:
+	/**
+	 * Constructor
+	 * @param n: The number of threads in the pool
+	 */
 	ThreadPool(size_t n) {
 		for (size_t i = 0; i < n; i++) {
 			_threads.emplace_back(&ThreadPool::loop, this);
 		}
 	}
+	/**
+	 * Stops and joins all the threads.
+	 * If a thread is busy executing a task, it will only be stopped after
+	 * finishing it.
+	 * @param cancel: If true, all tasks still awaiting execution in the
+	 * internal queue will be cancelled. Their corresponding std::future objects
+	 * will then contain an instance of operation_cancelled_exception as a
+	 * result
+	 */
 	void stop(bool cancel = false) {
 		std::unique_lock<std::mutex> lock(_mutex);
 		if (_stopped) return;
@@ -70,12 +87,27 @@ public:
 		_cv.notify_all();
 		join();
 	}
+	/**
+	 * Blocks the current thread until all tasks are finished being executed
+	 */
 	void wait() {
 		std::unique_lock<std::mutex> lock(_mutex);
 		if (_stopped || !_tasks_running) return;
 		_cv.wait(lock, [this]() { return !this->_tasks_running; });
 		// std::cout << "All tasks over\n";
 	}
+
+	/**
+	 * Enqueues a new task that will get executed by a thread, when one becomes
+	 * available
+	 * @param f: The callable object to invoke during the task
+	 * @param args: The arguments that will be forwarded to f
+	 * @returns A std::future object that can be used to wait on the task, and
+	 * retrieve its result
+	 * @note If the task gets cancelled by a call to stop(), the associated
+	 * std::future object will contain an instance of
+	 * operation_cancelled_exception
+	 */
 	template <typename Func>
 	[[nodiscard]]
 	std::future<T> run_task(Func &&f, Args... args) {
@@ -94,7 +126,12 @@ public:
 		_cv.notify_one();
 		return r;
 	}
-	~ThreadPool() { stop(); }
+	/**
+	 * Destructor: effectively calls the stop() method, and may therefore block
+	 * if tasks are currently being executed. All tasks still in the queue will
+	 * get cancelled.
+	 */
+	~ThreadPool() { stop(true); }
 
 private:
 	void join() {
