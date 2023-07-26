@@ -22,6 +22,9 @@ void g(int x) {
 	std::cout << x << '\n';
 }
 
+void bar() {}
+void baz() {}
+
 int main(int argc, char const *argv[]) {
 	ThreadPool<Foo(Foo)> tp(2);
 	for (int x : { 500, 1000, 1500 }) {
@@ -36,5 +39,4 @@ int main(int argc, char const *argv[]) {
 		tp2.run_task(g, x);
 	}
 	tp2.wait();
-	return 0;
 }

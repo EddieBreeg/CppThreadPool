@@ -26,7 +26,6 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <cstddef>
 #include <functional>
 #include <future>
-#include <optional>
 #include <queue>
 #include <thread>
 #include <tuple>
@@ -55,7 +54,7 @@ public:
 		}
 	}
 	void stop(bool cancel = false) {
-		std::unique_lock lock(_mutex);
+		std::unique_lock<std::mutex> lock(_mutex);
 		if (_stopped) return;
 		if (cancel) {
 			// empty the task queue
@@ -72,7 +71,7 @@ public:
 		join();
 	}
 	void wait() {
-		std::unique_lock lock(_mutex);
+		std::unique_lock<std::mutex> lock(_mutex);
 		if (_stopped || !_tasks_running) return;
 		_cv.wait(lock, [this]() { return !this->_tasks_running; });
 		// std::cout << "All tasks over\n";
@@ -82,7 +81,7 @@ public:
 	std::future<T> run_task(Func &&f, Args... args) {
 		std::future<T> r;
 		{
-			std::lock_guard lock(_mutex);
+			std::lock_guard<std::mutex> lock(_mutex);
 			if (_stopped) return r;
 			std::promise<T> p;
 			r = p.get_future();
@@ -102,10 +101,44 @@ private:
 		for (auto &t : _threads)
 			t.join();
 	}
+#if __cplusplus < 201703L
+	template <class Func, class _Tuple, size_t... I>
+	inline decltype(auto) call(std::index_sequence<I...>, Func &&f,
+							   _Tuple &&args) {
+		return f(std::get<I>(std::forward<_Tuple>(args))...);
+	}
+	template <class Func, class _Tuple>
+	decltype(auto) call(Func &&f, _Tuple &&args) {
+		using indices_t =
+			std::make_integer_sequence<size_t, std::tuple_size_v<_Tuple>>;
+		return call(indices_t{}, std::forward<Func>(f),
+					std::forward<_Tuple>(args));
+	}
+#endif
+	template <class U, std::enable_if_t<std::is_void_v<U>, nullptr_t> = nullptr>
+	void invoke_task(task &&t) {
+#if __cplusplus < 201703L
+		call(std::move(t._f), std::move(t._args));
+#else
+		std::apply(std::move(t._f), std::move(t._args));
+#endif
+		t._p.set_value();
+	}
+
+	template <class U,
+			  std::enable_if_t<!std::is_void_v<U>, nullptr_t> = nullptr>
+	void invoke_task(task &&t) {
+#if __cplusplus < 201703L
+		t._p.set_value(call(std::move(t._f), std::move(t._args)));
+#else
+		t._p.set_value(std::bind(std::move(t._f), std::move(t._args)));
+#endif
+	}
+
 	void loop() {
 		for (;;) {
 			{
-				std::unique_lock lock(_mutex);
+				std::unique_lock<std::mutex> lock(_mutex);
 				_cv.wait(lock, [this]() {
 					return this->_stopped || this->_tasks_running;
 				});
@@ -115,16 +148,9 @@ private:
 				task t = std::move(_tasks.front());
 				_tasks.pop();
 				lock.unlock();
-
-				if constexpr (std::is_void_v<T>) {
-					std::apply(t._f, t._args);
-					t._p.set_value();
-				} else {
-					T val = std::apply(t._f, std::move(t._args));
-					t._p.set_value(std::move(val));
-				}
+				invoke_task<T>(std::move(t));
 			}
-			std::unique_lock lock(_mutex);
+			std::unique_lock<std::mutex> lock(_mutex);
 			if (!--_tasks_running) {
 				lock.unlock();
 				_cv.notify_one();
