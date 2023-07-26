@@ -25,224 +25,117 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <condition_variable>
 #include <cstddef>
 #include <functional>
+#include <future>
 #include <optional>
 #include <queue>
 #include <thread>
 #include <tuple>
 #include <vector>
 
-/* Represents a pool of threads you can assign tasks to */
-template <class Task>
+struct operation_cancelled_exception : public std::exception {
+	inline const char *what() const { return "Operation was cancelled"; }
+};
+
+template <class Func>
 class ThreadPool;
 
 template <class T, typename... Args>
 class ThreadPool<T(Args...)> {
-public:
-	struct NoneType {};
-	using value_t = std::conditional_t<std::is_void_v<T>, NoneType, T>;
-
-private:
-	using unique_lock = std::unique_lock<std::mutex>;
-	struct _result_impl {
-		std::optional<value_t> _val;
-		std::mutex _m;
-		std::condition_variable _cv;
-		bool _cancelled = false;
+	using Tuple = std::tuple<Args...>;
+	struct task {
+		std::function<T(Args...)> _f;
+		Tuple _args;
+		std::promise<T> _p;
 	};
 
 public:
-	/* Represents a task result, which you can use to retrieve the return value
-	once the task is done executing
-	*/
-	class result {
-		friend class ThreadPool;
-		_result_impl *_res = new _result_impl;
-		result() = default;
-
-	public:
-		result(const result &) = delete;
-		result(result &&other) : _res(other._res) { other._res = nullptr; }
-		/* Queries the state of the corresponding task
-		@return true if the task finished executing correctly, false otherwise
-		@throw std::runtime_error if the result object is invalid
-		*/
-		bool ready() const {
-#ifndef NDEBUG
-			if (!_res) throw std::runtime_error("Invalid result object");
-#endif
-			unique_lock lock(_res->_m);
-			return !_res->_cancelled && (bool)_res->_val;
-		}
-		/* Waits until the task is either done, or cancelled
-		@return true if the task finished and a result is available, false
-		otherwise
-		@throw std::runtime_error if the result object is invalid
-		 */
-		bool wait() {
-#ifndef NDEBUG
-			if (!_res) throw std::runtime_error("Invalid result object");
-#endif
-			unique_lock lock(_res->_m);
-			if (_res->_val) return true;
-			if (_res->_cancelled) return false;
-			_res->_cv.wait(lock, [this]() {
-				return (bool)_res->_val || _res->_cancelled;
-			});
-			return (bool)_res->_val;
-		}
-		/* Waits for the task to finish or be cancelled, and returns the result
-		@return An object which contains the return value if the task finished
-		succesfully, or nothing if the task was cancelled. If the underlying
-		callable object had void as a return type, the result will be
-		ThreadPool::NoneType
-		@throw std::runtime_error if the result object is invalid
-		 */
-		std::optional<value_t> get() {
-#ifndef NDEBUG
-			if (!_res) throw std::runtime_error("Invalid result object");
-#endif
-			wait();
-			return std::move(_res->_val);
-		}
-		~result() {
-			if (!_res) return;
-			wait();
-			delete _res;
-		}
-	};
-
-	/* Constructor
-	@param n: The number of threads to create
-	 */
-	explicit ThreadPool(size_t n) {
+	ThreadPool(size_t n) {
 		for (size_t i = 0; i < n; i++) {
-			_threads.emplace_back(&ThreadPool::thread_loop, this);
+			_threads.emplace_back(&ThreadPool::loop, this);
 		}
 	}
-	ThreadPool(ThreadPool &) = delete;
-	/* Restarts the thread pool if it had previously been stopped. Otherwise,
-	 * does nothing */
-	void restart() {
-		std::lock_guard lock(_mutex);
-		if (!_stopped) return;
-		_stopped = false;
-		for (auto &t : _threads) {
-			t = std::thread(&ThreadPool::thread_loop, this);
+	void stop(bool cancel = false) {
+		std::unique_lock lock(_mutex);
+		if (_stopped) return;
+		if (cancel) {
+			// empty the task queue
+			while (!_tasks.empty()) {
+				task &&t = std::move(_tasks.front());
+				_tasks.pop();
+				t._p.set_exception(
+					std::make_exception_ptr(operation_cancelled_exception{}));
+			}
 		}
+		_stopped = true;
+		lock.unlock();
+		_cv.notify_all();
+		join();
 	}
-	/* Enqueues a new task
-	@param f: The callable object to invoke
-	@param args: The arguments to forward to f
-	@return A result object you can use to wait to the task to end, and retrieve
-	the result
-	@warning If the return value is discarded, the current thread will block
-	until the newly created task is over
-	 */
-	template <class F>
+	void wait() {
+		std::unique_lock lock(_mutex);
+		if (_stopped || !_tasks_running) return;
+		_cv.wait(lock, [this]() { return !this->_tasks_running; });
+		// std::cout << "All tasks over\n";
+	}
+	template <typename Func>
 	[[nodiscard]]
-	result run_task(F &&f, Args &&...args) {
-		result r;
-		std::tuple<Args &&...> A{ std::forward<Args>(args)... };
+	std::future<T> run_task(Func &&f, Args... args) {
+		std::future<T> r;
 		{
 			std::lock_guard lock(_mutex);
-			_tasks.emplace(task{ r._res, f, std::move(A) });
-			_running_task = true;
+			if (_stopped) return r;
+			std::promise<T> p;
+			r = p.get_future();
+
+			// std::cout << "Enqueuing task\n";
+			Tuple A{ std::forward<Args>(args)... };
+			_tasks.emplace(task{ f, std::move(A), std::move(p) });
+			++_tasks_running;
 		}
 		_cv.notify_one();
 		return r;
 	}
-	/* Stops the threads.
-	If cancel is set to false, the current thread will block
-	until all tasks in the queue have been processed. Otherwise, the tasks
-	still awaiting for execution will get cancelled. Either way, the tasks
-	currently being executing will finish normally
-	@param cancel: Whether to cancel the tasks still in the queue
-	 */
-	void stop(bool cancel = false) {
-		if (_stopped) return;
-		if (!cancel) {
-			wait();
-			{
-				std::lock_guard lock(_mutex);
-				_stopped = true;
-			}
-			_cv.notify_all();
-			join_threads();
-			return;
-		}
-		{
-			std::lock_guard lock(_mutex);
-			_stopped = true;
-			_cv.notify_all();
-			while (!_tasks.empty()) {
-				task &&t = std::move(_tasks.front());
-				_tasks.pop();
-				{
-					std::lock_guard lock(t._res->_m);
-					t._res->_cancelled = true;
-				}
-				t._res->_cv.notify_one();
-			}
-		}
-		join_threads();
-	}
-	/* Wait until all tasks in the queue have been processed */
-	void wait() {
-		unique_lock lock(_waitMutex);
-		if (!_running_task || _stopped) return;
-		_cv.wait(lock, [this]() { return !this->_running_task; });
-	}
 	~ThreadPool() { stop(); }
 
 private:
-	inline void join_threads() {
-		for (auto &t : _threads) {
+	void join() {
+		for (auto &t : _threads)
 			t.join();
-		}
 	}
-	struct task {
-		_result_impl *_res;
-		std::function<T(Args...)> _f;
-		std::tuple<Args &&...> _args;
-	};
-	void thread_loop() {
+	void loop() {
 		for (;;) {
-			unique_lock lock(_mutex);
-			_cv.wait(lock, [this]() {
-				return this->_stopped || this->_running_task;
-			});
-			if (_stopped) return;
-			if (_tasks.empty()) continue;
-			task t = std::move(_tasks.front());
-			_tasks.pop();
-			lock.unlock();
-			if constexpr (!std::is_void_v<T>) {
-				auto val = std::apply(t._f, std::move(t._args));
-				{
-					std::lock_guard lock{ t._res->_m };
-					t._res->_val = std::move(val);
-				}
-			} else {
-				std::apply(t._f, std::move(t._args));
-				std::lock_guard lock{ t._res->_m };
-				t._res->_val = NoneType{};
-			}
-			t._res->_cv.notify_one();
 			{
-				std::lock_guard lock(_waitMutex);
-				if (_running_task && _tasks.empty()) {
-					_running_task = false;
-					_cv.notify_one();
+				std::unique_lock lock(_mutex);
+				_cv.wait(lock, [this]() {
+					return this->_stopped || this->_tasks_running;
+				});
+				if (_stopped) return;
+				if (_tasks.empty()) continue;
+				// std::cout << "Picking up task\n";
+				task t = std::move(_tasks.front());
+				_tasks.pop();
+				lock.unlock();
+
+				if constexpr (std::is_void_v<T>) {
+					std::apply(t._f, t._args);
+					t._p.set_value();
+				} else {
+					T val = std::apply(t._f, std::move(t._args));
+					t._p.set_value(std::move(val));
 				}
+			}
+			std::unique_lock lock(_mutex);
+			if (!--_tasks_running) {
+				lock.unlock();
+				_cv.notify_one();
 			}
 		}
 	}
-	std::vector<std::thread> _threads;
-	std::mutex _mutex, _waitMutex;
 	std::condition_variable _cv;
-	bool _stopped = false;
-	bool _running_task = false;
+	std::mutex _mutex;
+	std::vector<std::thread> _threads;
 	std::queue<task> _tasks;
+	bool _stopped = false;
+	int _tasks_running = 0;
 };
-
 #endif // THREAD_POOL_H
